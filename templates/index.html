@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chord Learning App</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            text-align: center;
+        }
+        .button-row {
+            display: flex;
+            justify-content: space-between;
+            margin: 30px 0;
+        }
+        button {
+            padding: 15px 25px;
+            font-size: 16px;
+            cursor: pointer;
+            border: none;
+            border-radius: 5px;
+        }
+        .rating-btn {
+            width: 18%;
+        }
+        .very-bad { background-color: #ff6b6b; }
+        .bad { background-color: #ffa06b; }
+        .okay { background-color: #ffda6b; }
+        .good { background-color: #a0ff6b; }
+        .very-good { background-color: #6bff6b; }
+        
+        .button-container {
+            display: flex;
+            justify-content: center;
+            margin: 20px auto;
+            gap: 20px;
+        }
+        
+        .play-btn {
+            background-color: #6b9fff;
+            width: 200px;
+            padding: 15px 25px;
+            font-size: 16px;
+            cursor: pointer;
+            border: none;
+            border-radius: 5px;
+        }
+        
+        .slider-container {
+            margin: 40px 0;
+        }
+        .slider {
+            width: 80%;
+            margin: 10px auto;
+        }
+        
+        #current-chord {
+            font-family: monospace;
+            margin: 20px 0;
+            font-size: 18px;
+        }
+        
+        #avg-rating {
+            margin-top: 30px;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <h1>Chord Learning App</h1>
+    <p>Rate chords to help the model learn your preferences</p>
+    
+    <div class="button-container">
+        <button class="play-btn" id="play-button">Play Chord</button>
+        <button class="play-btn" id="new-chord-button" style="background-color: #6bff9f;">New Chord</button>
+    </div>
+    
+    <div id="current-chord">No chord played yet</div>
+    
+    <div class="slider-container">
+        <p>Exploration Rate: <span id="exploration-value">30%</span></p>
+        <input type="range" min="0" max="100" value="30" class="slider" id="exploration-slider">
+    </div>
+    
+    <div class="button-row">
+        <button class="rating-btn very-bad" data-rating="1">Very Bad</button>
+        <button class="rating-btn bad" data-rating="2">Bad</button>
+        <button class="rating-btn okay" data-rating="3">Okay</button>
+        <button class="rating-btn good" data-rating="4">Good</button>
+        <button class="rating-btn very-good" data-rating="5">Very Good</button>
+    </div>
+    
+    <div id="avg-rating">Average rating: N/A</div>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const playButton = document.getElementById('play-button');
+            const newChordButton = document.getElementById('new-chord-button');
+            const ratingButtons = document.querySelectorAll('.rating-btn');
+            const currentChordDisplay = document.getElementById('current-chord');
+            const avgRatingDisplay = document.getElementById('avg-rating');
+            const explorationSlider = document.getElementById('exploration-slider');
+            const explorationValue = document.getElementById('exploration-value');
+            
+            let currentChord = null;
+            let explorationRate = 0.3;
+            
+            // Update exploration rate display
+            explorationSlider.addEventListener('input', function() {
+                explorationRate = this.value / 100;
+                explorationValue.textContent = this.value + '%';
+            });
+            
+            // New chord button
+            newChordButton.addEventListener('click', function() {
+                // Reset current chord
+                currentChord = null;
+                
+                // Then trigger the play button
+                playButton.click();
+            });
+            
+            // Play chord button
+            playButton.addEventListener('click', function() {
+                playButton.disabled = true;
+                playButton.textContent = 'Playing...';
+                
+                const isNewChord = currentChord === null;
+                
+                fetch('/play_chord', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        action: isNewChord ? 'new' : 'replay'
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    currentChord = data.chord;
+                    currentChordDisplay.textContent = 'Current Chord: ' + formatChord(currentChord);
+                    playButton.disabled = false;
+                    playButton.textContent = 'Replay Chord';
+                    
+                    // Enable rating buttons
+                    ratingButtons.forEach(btn => {
+                        btn.disabled = false;
+                    });
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    playButton.disabled = false;
+                    playButton.textContent = 'Replay Chord';
+                });
+            });
+            
+            // Rating buttons
+            ratingButtons.forEach(button => {
+                button.addEventListener('click', function() {
+                    if (currentChord === null) {
+                        alert('Please play a chord first!');
+                        return;
+                    }
+                    
+                    const rating = this.getAttribute('data-rating');
+                    
+                    // Disable all rating buttons until next chord
+                    ratingButtons.forEach(btn => {
+                        btn.disabled = true;
+                    });
+                    
+                    fetch('/rate_chord', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            rating: rating,
+                            exploration: explorationRate
+                        })
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            currentChord = null;
+                            currentChordDisplay.textContent = 'Rate the chord above';
+                            playButton.textContent = 'Play Chord';
+                            
+                            if (data.avg_rating) {
+                                avgRatingDisplay.textContent = 'Average rating: ' + 
+                                    data.avg_rating.toFixed(2);
+                            }
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error:', error);
+                    });
+                });
+            });
+            
+            // Disable rating buttons initially
+            ratingButtons.forEach(btn => {
+                btn.disabled = true;
+            });
+            
+            // Helper function to format chord nicely
+            function formatChord(chord) {
+                if (!chord) return 'None';
+                
+                // Convert MIDI numbers to note names
+                const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+                
+                return chord.map(midiNote => {
+                    const octave = Math.floor(midiNote / 12) - 1;
+                    const noteName = noteNames[midiNote % 12];
+                    return noteName + octave;
+                }).join(', ');
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+flask==2.0.1
+werkzeug==2.0.1
+numpy==2.2.3
+torch==2.6.0
+# Optional audio libraries - comment out those you can't install
+# simpleaudio==1.0.4  # Needs dev tools on some platforms
+pygame==2.0.3 
