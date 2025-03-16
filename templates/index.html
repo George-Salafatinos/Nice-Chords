@@ -2,6 +2,7 @@
 <html>
 <head>
     <title>Chord Learning App</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.7.1/chart.min.js"></script>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -93,16 +94,87 @@
     </div>
     
     <div id="avg-rating">Average rating: N/A</div>
+    <div id="stats">Chords rated: 0</div>
+    
+    <div style="width: 100%; height: 200px; margin-top: 30px;">
+        <canvas id="rating-chart"></canvas>
+    </div>
     
     <script>
         document.addEventListener('DOMContentLoaded', function() {
+            // Load stats when page loads
+            fetch('/get_stats')
+                .then(response => response.json())
+                .then(data => {
+                    chordsRated = data.chords_rated;
+                    statsDisplay.textContent = `Chords rated: ${chordsRated}`;
+                    
+                    if (data.recent_ratings && data.recent_ratings.length > 0) {
+                        avgRatingDisplay.textContent = 'Average rating: ' + 
+                            (data.recent_ratings.reduce((a, b) => a + b, 0) / data.recent_ratings.length).toFixed(2);
+                    }
+                    
+                    // Initialize chart with recent ratings if available
+                    if (data.recent_ratings && data.recent_ratings.length > 0) {
+                        const startIndex = Math.max(0, chordsRated - data.recent_ratings.length);
+                        
+                        for (let i = 0; i < data.recent_ratings.length; i++) {
+                            ratingChart.data.labels.push(startIndex + i + 1);
+                            ratingChart.data.datasets[0].data.push(data.recent_ratings[i]);
+                        }
+                        
+                        ratingChart.update();
+                    }
+                })
+                .catch(error => {
+                    console.error('Error loading stats:', error);
+                });
             const playButton = document.getElementById('play-button');
             const newChordButton = document.getElementById('new-chord-button');
             const ratingButtons = document.querySelectorAll('.rating-btn');
             const currentChordDisplay = document.getElementById('current-chord');
             const avgRatingDisplay = document.getElementById('avg-rating');
+            const statsDisplay = document.getElementById('stats');
             const explorationSlider = document.getElementById('exploration-slider');
             const explorationValue = document.getElementById('exploration-value');
+            
+            // Chart setup
+            const ctx = document.getElementById('rating-chart').getContext('2d');
+            const ratingChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'Average Rating',
+                        data: [],
+                        borderColor: 'rgb(75, 192, 192)',
+                        tension: 0.1,
+                        fill: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            min: 1,
+                            max: 5,
+                            title: {
+                                display: true,
+                                text: 'Rating'
+                            }
+                        },
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Chords'
+                            }
+                        }
+                    }
+                }
+            });
+            
+            let chordsRated = 0;
+            let allRatings = [];
             
             let currentChord = null;
             let explorationRate = 0.3;
@@ -192,6 +264,31 @@
                             if (data.avg_rating) {
                                 avgRatingDisplay.textContent = 'Average rating: ' + 
                                     data.avg_rating.toFixed(2);
+                            }
+                            
+                            // Update chord count and chart
+                            chordsRated++;
+                            statsDisplay.textContent = `Chords rated: ${chordsRated}`;
+                            
+                            // Add to the ratings history
+                            allRatings.push(parseInt(rating));
+                            
+                            // Calculate moving average
+                            const windowSize = 5;
+                            if (allRatings.length >= windowSize) {
+                                const movingAvg = allRatings.slice(-windowSize).reduce((a, b) => a + b, 0) / windowSize;
+                                
+                                // Update chart
+                                ratingChart.data.labels.push(chordsRated);
+                                ratingChart.data.datasets[0].data.push(movingAvg);
+                                
+                                // Keep chart from getting too crowded
+                                if (ratingChart.data.labels.length > 30) {
+                                    ratingChart.data.labels.shift();
+                                    ratingChart.data.datasets[0].data.shift();
+                                }
+                                
+                                ratingChart.update();
                             }
                         }
                     })

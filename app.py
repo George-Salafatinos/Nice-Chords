@@ -58,7 +58,7 @@ def create_sine_wave(freq, duration=1.0):
 # Dictionary to cache generated sounds
 sound_cache = {}
 
-# PPO Policy Network
+# PPO Policy Network with Improved Representation
 class PolicyNetwork(nn.Module):
     def __init__(self, input_dim=16, hidden_dim=64, num_notes=4):
         super(PolicyNetwork, self).__init__()
@@ -69,8 +69,12 @@ class PolicyNetwork(nn.Module):
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         
-        # Output 4 notes (each 0-127 MIDI value)
-        self.note_heads = nn.ModuleList([nn.Linear(hidden_dim, 128) for _ in range(num_notes)])
+        # Base note output (0-127 MIDI value)
+        self.base_note_head = nn.Linear(hidden_dim, 128)
+        
+        # Interval outputs (0-48 semitones above base note)
+        # Using 48 as max interval (4 octaves) for reasonable range
+        self.interval_heads = nn.ModuleList([nn.Linear(hidden_dim, 49) for _ in range(num_notes-1)])
         
         # Value head for PPO
         self.value_head = nn.Linear(hidden_dim, 1)
@@ -79,37 +83,54 @@ class PolicyNetwork(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         
-        # Get logits for each note
-        note_logits = [head(x) for head in self.note_heads]
+        # Get logits for base note
+        base_note_logits = self.base_note_head(x)
         
-        # Apply exploration noise to logits
+        # Apply exploration noise
         if exploration_rate > 0:
-            note_logits = [logits + torch.randn_like(logits) * exploration_rate * 0.5 
-                          for logits in note_logits]
+            base_note_logits = base_note_logits + torch.randn_like(base_note_logits) * exploration_rate * 0.5
         
-        # Get probabilities for each note
-        note_probs = [F.softmax(logits, dim=1) for logits in note_logits]
+        # Get logits for intervals
+        interval_logits = []
+        for head in self.interval_heads:
+            logits = head(x)
+            if exploration_rate > 0:
+                logits = logits + torch.randn_like(logits) * exploration_rate * 0.5
+            interval_logits.append(logits)
+        
+        # Get probabilities
+        base_note_probs = F.softmax(base_note_logits, dim=1)
+        interval_probs = [F.softmax(logits, dim=1) for logits in interval_logits]
         
         # Value estimate
         value = self.value_head(x)
         
-        return note_logits, note_probs, value
+        return [base_note_logits] + interval_logits, [base_note_probs] + interval_probs, value
     
     def get_chord(self, x, exploration_rate=0.2):
         """Generate a chord from the policy network"""
         with torch.no_grad():
-            _, note_probs, _ = self.forward(x, exploration_rate)
+            _, probs, _ = self.forward(x, exploration_rate)
             
-            # Sample from each distribution
-            note_dists = [Categorical(probs) for probs in note_probs]
-            notes = [dist.sample().item() for dist in note_dists]
+            base_note_probs = probs[0]
+            interval_probs = probs[1:]
             
-            # Constrain notes to middle registers for more pleasant sound
-            # MIDI notes 48-84 = C3 to C6 (middle register of piano)
-            notes = [n % 36 + 48 for n in notes]  # Map to reasonable octaves
+            # Sample base note and intervals
+            base_note_dist = Categorical(base_note_probs)
+            interval_dists = [Categorical(p) for p in interval_probs]
             
-            # Log probabilities of chosen notes
-            log_probs = [dist.log_prob(torch.tensor(note % 128)) for dist, note in zip(note_dists, notes)]
+            base_note = base_note_dist.sample().item()
+            intervals = [dist.sample().item() for dist in interval_dists]
+            
+            # Constrain base note to a reasonable range (C3-C5)
+            base_note = base_note % 24 + 48  # Middle two octaves
+            
+            # Calculate actual notes
+            notes = [base_note] + [base_note + interval for interval in intervals]
+            
+            # Get log probabilities
+            log_probs = [base_note_dist.log_prob(torch.tensor(base_note % 128))] + \
+                       [dist.log_prob(torch.tensor(interval)) for dist, interval in zip(interval_dists, intervals)]
             
         return notes, log_probs
 
@@ -133,32 +154,154 @@ class PPOOptimizer:
         self.ratings = []
         self.values = []
         
+        # Extended memory for retraining
+        self.history_states = []
+        self.history_notes = []
+        self.history_ratings = []
+        
         # Tracking statistics
         self.best_model_state = None
         self.best_avg_rating = 0
         self.recent_ratings = []
+        self.last_retrain_count = 0
         
+        # Load saved model if it exists
+        self.model_path = "chord_model.pt"
+        self.history_path = "chord_history.pt"
+        self.load_model()
+        self.load_history()
+        
+    def save_model(self):
+        """Save the model and optimizer state"""
+        torch.save({
+            'model_state_dict': self.policy.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'best_model_state': self.best_model_state,
+            'best_avg_rating': self.best_avg_rating,
+            'recent_ratings': self.recent_ratings
+        }, self.model_path)
+        print(f"Model saved to {self.model_path}")
+    
+    def save_history(self):
+        """Save training history"""
+        torch.save({
+            'states': self.history_states,
+            'notes': self.history_notes,
+            'ratings': self.history_ratings
+        }, self.history_path)
+        print(f"History saved to {self.history_path}")
+    
+    def load_model(self):
+        """Load the model if it exists"""
+        try:
+            if os.path.exists(self.model_path):
+                checkpoint = torch.load(self.model_path)
+                self.policy.load_state_dict(checkpoint['model_state_dict'])
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.best_model_state = checkpoint['best_model_state']
+                self.best_avg_rating = checkpoint['best_avg_rating']
+                self.recent_ratings = checkpoint['recent_ratings']
+                print(f"Model loaded from {self.model_path}")
+                print(f"Best average rating: {self.best_avg_rating:.2f}")
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
+    
+    def load_history(self):
+        """Load training history if it exists"""
+        try:
+            if os.path.exists(self.history_path):
+                history = torch.load(self.history_path)
+                self.history_states = history['states']
+                self.history_notes = history['notes']
+                self.history_ratings = history['ratings']
+                print(f"History loaded with {len(self.history_ratings)} samples")
+        except Exception as e:
+            print(f"Error loading history: {str(e)}")
+            
     def store_transition(self, state, notes, log_probs, rating, value):
-        self.states.append(state)
+        """Store the transition for optimization and history"""
+        # Make deep copies to avoid modifying tensors in-place
+        self.states.append(state.clone().detach())
         self.notes.append(notes)
-        self.log_probs.append(log_probs)
+        # Make copies of log_probs which are scalar tensors
+        self.log_probs.append([p.clone().detach() for p in log_probs])
         self.ratings.append(rating)
-        self.values.append(value)
+        self.values.append(value.clone().detach())
+        
+        # Also store in history for retraining
+        self.history_states.append(state.clone().detach())
+        self.history_notes.append(notes)
+        self.history_ratings.append(rating)
         
         # Keep track of recent ratings
         self.recent_ratings.append(rating)
         if len(self.recent_ratings) > 10:
             self.recent_ratings.pop(0)
+            
+        # Save after every 5 ratings
+        if len(self.history_ratings) % 5 == 0:
+            self.save_model()
+            self.save_history()
+    
+    def retrain_on_history(self, epochs=1):
+        """Retrain the model on all historical data"""
+        if len(self.history_states) < 5:
+            return  # Not enough data
+            
+        print(f"Retraining on {len(self.history_ratings)} historical samples...")
+        
+        try:
+            # Create a completely new computation graph with deep copies
+            hist_states = torch.cat([s.clone().detach() for s in self.history_states], dim=0)
+            hist_ratings = torch.tensor(self.history_ratings, dtype=torch.float).unsqueeze(1).clone().detach()
+            
+            # Normalize ratings
+            mean_rating = sum(self.history_ratings) / len(self.history_ratings)
+            std_rating = max(0.1, np.std(self.history_ratings))
+            normalized_ratings = ((hist_ratings - mean_rating) / std_rating).clone().detach()
+            
+            # Training loop
+            for epoch in range(epochs):
+                # Make sure to zero gradients
+                self.optimizer.zero_grad()
+                
+                # Forward pass for training
+                _, _, new_values = self.policy(hist_states)
+                
+                # Value loss (mean squared error)
+                value_loss = F.mse_loss(new_values, normalized_ratings)
+                
+                # Update
+                value_loss.backward()
+                self.optimizer.step()
+                
+            print("Retraining complete.")
+        except Exception as e:
+            print(f"Error during retraining: {str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def update(self):
         # Need at least one sample to update
         if len(self.states) == 0:
             return 0.0
-
-        # Convert to tensors
-        states = torch.cat(self.states, dim=0)
-        ratings = torch.tensor(self.ratings).unsqueeze(1)
-        old_values = torch.cat(self.values, dim=0)
+            
+        # Check if we should do periodic retraining (every 20 samples)
+        total_samples = len(self.history_ratings)
+        if total_samples % 20 == 0 and total_samples > 0 and total_samples != self.last_retrain_count and total_samples > self.last_retrain_count:
+            self.last_retrain_count = total_samples
+            try:
+                self.retrain_on_history()
+            except Exception as e:
+                print(f"Error during retraining: {str(e)}")
+        
+        # Convert to tensors - make deep copies to avoid in-place modifications
+        states = torch.cat([s.clone() for s in self.states], dim=0)
+        ratings = torch.tensor(self.ratings, dtype=torch.float).unsqueeze(1).clone()
+        old_values = torch.cat([v.clone() for v in self.values], dim=0)
+        
+        # Store old policy parameters for PPO ratio calculation
+        old_log_probs = [[p.clone() for p in sublist] for sublist in self.log_probs]
         
         # Normalize ratings to zero mean, unit variance for more stable learning
         if len(self.recent_ratings) > 3:
@@ -184,19 +327,24 @@ class PPOOptimizer:
         
         # Only update if we're doing reasonably well or just starting
         if len(self.recent_ratings) < 5 or current_avg_rating > self.best_avg_rating * 0.9:
-            # Calculate policy loss
+            # Calculate policy loss - create fresh computation graph
             for _ in range(1):  # Just one update per sample for simplicity
-                # Get current probabilities
+                self.optimizer.zero_grad()
+                
+                # Forward pass with fresh computation graph
                 new_logits, _, new_values = self.policy(states)
                 
                 policy_loss = 0
                 for i in range(len(self.states)):
                     for j in range(self.policy.num_notes):
-                        old_log_prob = self.log_probs[i][j]
+                        old_log_prob = old_log_probs[i][j]
                         note = self.notes[i][j]
                         
                         # Ensure note is in valid range for indexing
-                        note_idx = note % 128
+                        note_idx = min(note % 128, 127)  # Clamp to valid range
+                        if note_idx >= new_logits[j].size(1):
+                            note_idx = new_logits[j].size(1) - 1
+                        
                         new_log_prob = F.log_softmax(new_logits[j][i], dim=0)[note_idx]
                         
                         ratio = torch.exp(new_log_prob - old_log_prob)
@@ -218,7 +366,6 @@ class PPOOptimizer:
                 loss = policy_loss + self.value_coef * value_loss - 0.01 * entropy
                 
                 # Update
-                self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
             
@@ -300,23 +447,34 @@ def learning_task():
     
     # Generate random state
     state = torch.randn(1, model.input_dim)
-    current_state = state
+    current_state = state.clone().detach()  # Make a detached copy
     
     # Get chord from policy
     chord, log_probs = model.get_chord(state, exploration_rate)
     
     # Get value estimate
-    _, _, value = model.forward(state)
+    with torch.no_grad():  # Use no_grad to avoid computation graph issues
+        _, _, value = model.forward(state)
     
     current_chord = chord
-    current_log_probs = log_probs
-    current_value = value
+    current_log_probs = [p.clone().detach() for p in log_probs]  # Make copies
+    current_value = value.clone().detach()  # Make a copy
     
     # Sort for better harmony
     chord.sort()
     
     # Play the chord
     play_chord(chord)
+
+@app.route('/get_stats', methods=['GET'])
+def get_stats():
+    """Get current stats about the model and training"""
+    stats = {
+        'chords_rated': len(optimizer.history_ratings),
+        'best_avg_rating': optimizer.best_avg_rating,
+        'recent_ratings': optimizer.recent_ratings
+    }
+    return jsonify(stats)
 
 @app.route('/')
 def index():
